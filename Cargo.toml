@@ -1,0 +1,37 @@
+[package]
+name = "synapse-vault-client"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "synapse_vault_client"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0.100"
+base64 = "0.22.1"
+bytes = "1.10.1"
+futures = "0.3.31"
+futures-util = "0.3.31"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "http2",
+    "stream",
+] }
+serde = "1.0.228"
+serde_json = "1.0.145"
+uuid = { version = "1.18.1", features = ["serde", "v4", "v8"] }
+synapse-iam-client = { path = "../synapse-iam-client" }
+chrono = "0.4.42"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["full"] }
+uuid = "1.18.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { version = "1.18.1", features = ["js"] }
+getrandom = { version = "0.2", features = ["js"] }
+tokio = { version = "1", features = ["macros", "rt", "time", "sync"] }
+console_error_panic_hook = "0.1"
+tracing-wasm = "0.2"
