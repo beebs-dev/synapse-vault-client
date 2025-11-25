@@ -243,66 +243,119 @@ impl Client {
         tx: mpsc::Sender<UploadProgress>,
     ) -> Result<UploadChunkResponse> {
         let chunk_len = chunk.len() as u64;
-
-        // Tune this to control event granularity & backpressure overhead
-        const SLICE: usize = 128 * 1024; // 128 KiB
-
-        // State for the progress stream
-        let tx_opt = Some(tx); // drop when receiver is gone to stop tries
-
         let started_at = chrono::Utc::now();
         let started_at_ms = started_at.timestamp_millis();
+        const SLICE: usize = 128 * 1024; // 128 KiB
 
-        // Build a stream that yields Bytes slices and reports progress per slice
-        let stream = stream::unfold((chunk, 0, 0, tx_opt), move |state| {
-            let (data, mut off, mut sent, mut tx_opt_inner) = state;
-            async move {
-                if off >= data.len() {
-                    return None; // finished
-                }
-                let end = (off + SLICE).min(data.len());
-                let slice = Bytes::copy_from_slice(&data[off..end]);
-                off = end;
-                sent += slice.len() as u64;
-                let uploaded_bytes = sent;
-                if let Some(tx) = tx_opt_inner.as_ref() {
-                    if tx
-                        .send(UploadProgress {
-                            upload_id,
-                            uploaded_bytes,
-                            chunk_no,
-                            started_at: started_at_ms,
-                            elapsed: chrono::Utc::now()
-                                .signed_duration_since(started_at)
-                                .num_milliseconds(),
-                            total_bytes: chunk_len,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        // Receiver was dropped; stop further attempts
-                        tx_opt_inner = None;
+        // -----------------------
+        // Non-WASM: true streaming
+        // -----------------------
+        #[cfg(not(target_arch = "wasm32"))]
+        let req = {
+            use std::io;
+
+            // keep this local so wasm build doesn't see it
+            let tx_opt = Some(tx);
+
+            let stream = stream::unfold((chunk, 0usize, 0u64, tx_opt), move |state| {
+                let (data, mut off, mut sent, mut tx_opt_inner) = state;
+                async move {
+                    if off >= data.len() {
+                        return None;
                     }
+
+                    let end = (off + SLICE).min(data.len());
+                    let slice = Bytes::copy_from_slice(&data[off..end]);
+                    off = end;
+                    sent += slice.len() as u64;
+                    let uploaded_bytes = sent;
+
+                    if let Some(tx) = tx_opt_inner.as_ref() {
+                        if tx
+                            .send(UploadProgress {
+                                upload_id,
+                                uploaded_bytes,
+                                chunk_no,
+                                started_at: started_at_ms,
+                                elapsed: chrono::Utc::now()
+                                    .signed_duration_since(started_at)
+                                    .num_milliseconds(),
+                                total_bytes: chunk_len,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            // receiver dropped -> stop sending progress
+                            tx_opt_inner = None;
+                        }
+                    }
+
+                    Some((
+                        Ok::<Bytes, io::Error>(slice),
+                        (data, off, sent, tx_opt_inner),
+                    ))
                 }
-                Some((
-                    Ok::<Bytes, io::Error>(slice),
-                    (data, off, sent, tx_opt_inner),
-                ))
+            });
+
+            self.add_auth(self.inner.client.post(&format!(
+                "{}/upload/{}/chunk/{}",
+                self.endpoint, upload_id, chunk_no
+            )))
+            .body(reqwest::Body::wrap_stream(stream))
+        };
+
+        // --------------------------------
+        // WASM: single body + local progress
+        // --------------------------------
+        #[cfg(target_arch = "wasm32")]
+        let req = {
+            let mut sent: u64 = 0;
+            let mut offset: usize = 0;
+
+            // We *simulate* progress based on how much of the buffer
+            // we've "prepared" – the browser fetch call itself is opaque.
+            while offset < chunk.len() {
+                let end = (offset + SLICE).min(chunk.len());
+                offset = end;
+                sent = end as u64;
+
+                // ignore error if receiver is gone
+                let _ = tx
+                    .send(UploadProgress {
+                        upload_id,
+                        uploaded_bytes: sent,
+                        chunk_no,
+                        started_at: started_at_ms,
+                        elapsed: chrono::Utc::now()
+                            .signed_duration_since(started_at)
+                            .num_milliseconds(),
+                        total_bytes: chunk_len,
+                    })
+                    .await;
             }
-        });
-        self.add_auth(self.inner.client.post(&format!(
-            "{}/upload/{}/chunk/{}",
-            self.endpoint, upload_id, chunk_no
-        )))
-        .body(reqwest::Body::wrap_stream(stream))
-        .send()
-        .await
-        .context("Failed to send upload request")?
-        .error_for_status()
-        .context("Upload request returned error status")?
-        .json()
-        .await
-        .context("Failed to parse upload chunk response")
+
+            self.add_auth(self.inner.client.post(&format!(
+                "{}/upload/{}/chunk/{}",
+                self.endpoint, upload_id, chunk_no
+            )))
+            // On wasm, reqwest's Body accepts Vec<u8> directly; no streaming.
+            .body(chunk)
+        };
+
+        // common send/parse path
+        let resp = req
+            .send()
+            .await
+            .context("Failed to send upload request")?
+            .error_for_status()
+            .context("Upload request returned error status")?;
+
+        let parsed = resp
+            .json::<UploadChunkResponse>()
+            .await
+            .context("Failed to parse upload chunk response")?;
+
+        Ok(parsed)
     }
 
     pub async fn upload_chunk(
